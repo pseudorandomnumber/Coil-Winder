@@ -2,6 +2,7 @@
 #include <WiFi.h>
 #include <ESPmDNS.h>
 #include <WebServer.h>
+#include "secrets.h"
 
 // Forward declarations
 void handleRoot();
@@ -107,8 +108,7 @@ bool homing = false;
 
 const char* AP_SSID = "CoilWinder";
 const char* AP_PASS = "coil1234";
-const char* WIFI_SSID = "PintOfWorms";
-const char* WIFI_PASS = "clubmate42";
+// WIFI_SSID and WIFI_PASS are defined in secrets.h
 IPAddress apIP(192, 168, 4, 1);
 WebServer server(80);
 String commandLine = "";
