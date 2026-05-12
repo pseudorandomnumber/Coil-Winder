@@ -446,9 +446,9 @@ void loop() {
     homing = true; homingState = 0;
     traverseLeft.setMaxSpeed(traverseSpeed * 0.5);
     traverseRight.setMaxSpeed(traverseSpeed * 0.5);
-    traverseLeft.moveTo(traverseLeft.currentPosition() - 100000);
-    traverseRight.moveTo(traverseRight.currentPosition() - 100000);
-    Serial.println("Homing: Seeking endstop...");
+    traverseLeft.moveTo(traverseLeft.currentPosition() + 100000);  // Seek endstop (Positive Direction)
+    traverseRight.moveTo(traverseRight.currentPosition() + 100000);
+    Serial.println("Homing: Seeking endstop (positive direction)...");
   }
 
   if (cmd_jog && !homing && !running) {
@@ -465,8 +465,8 @@ void loop() {
     startMotion();
   }
 
-  // EMERGENCY STOP PROBE CHECK (Active LOW)
-  if (digitalRead(PROBE_PIN) == LOW && (running || homing || jogging)) {
+  // EMERGENCY STOP PROBE CHECK (Active HIGH)
+  if (digitalRead(PROBE_PIN) == HIGH && (running || homing || jogging)) {
     running = false; homing = false; jogging = false;
     traverseLeft.stop(); traverseRight.stop(); spindle.stop();
     Serial.println("E-STOP TRIGGERED! All motion halted.");
@@ -524,20 +524,20 @@ void handleHoming() {
   // Switches are normally-open, pull pin to GND when triggered -> LOW = triggered
   bool x_endstop = (digitalRead(X_LIMIT_PIN) == LOW);
   bool y_endstop = (digitalRead(Y_LIMIT_PIN) == LOW);
-  
-  if (homingState == 0) { // Seeking (Negative Direction)
+
+  if (homingState == 0) { // Seeking (Positive Direction)
     if (x_endstop) traverseLeft.stop();
     if (y_endstop) traverseRight.stop();
-    
+
     if (traverseLeft.distanceToGo() == 0 && traverseRight.distanceToGo() == 0) {
       homingState = 4;
     }
-  } else if (homingState == 4) { // wait stop
+  } else if (homingState == 4) { // Wait for deceleration to finish
     if (traverseLeft.distanceToGo() == 0 && traverseRight.distanceToGo() == 0) {
       traverseLeft.setMaxSpeed(traverseSpeed * 0.25);
       traverseRight.setMaxSpeed(traverseSpeed * 0.25);
-      traverseLeft.moveTo(traverseLeft.currentPosition() + 100000); // Pull away (Positive Direction)
-      traverseRight.moveTo(traverseRight.currentPosition() + 100000);
+      traverseLeft.moveTo(traverseLeft.currentPosition() - 100000);  // Pull away (Negative Direction)
+      traverseRight.moveTo(traverseRight.currentPosition() - 100000);
       homingState = 1;
     }
   } else if (homingState == 1) { // Pulling away
@@ -547,12 +547,12 @@ void handleHoming() {
     if (traverseLeft.distanceToGo() == 0 && traverseRight.distanceToGo() == 0) {
       homingState = 5;
     }
-  } else if (homingState == 5) { // wait stop
+  } else if (homingState == 5) { // Wait for deceleration to finish
     if (traverseLeft.distanceToGo() == 0 && traverseRight.distanceToGo() == 0) {
       traverseLeft.setMaxSpeed(traverseSpeed * 0.05);
       traverseRight.setMaxSpeed(traverseSpeed * 0.05);
-      traverseLeft.moveTo(traverseLeft.currentPosition() - 100000); // Slow seek (Negative Direction)
-      traverseRight.moveTo(traverseRight.currentPosition() - 100000);
+      traverseLeft.moveTo(traverseLeft.currentPosition() + 100000);  // Slow seek (Positive Direction)
+      traverseRight.moveTo(traverseRight.currentPosition() + 100000);
       homingState = 2;
     }
   } else if (homingState == 2) { // Slow seek
@@ -562,13 +562,13 @@ void handleHoming() {
     if (traverseLeft.distanceToGo() == 0 && traverseRight.distanceToGo() == 0) {
       homingState = 6;
     }
-  } else if (homingState == 6) { // wait stop
+  } else if (homingState == 6) { // Wait for deceleration to finish
     if (traverseLeft.distanceToGo() == 0 && traverseRight.distanceToGo() == 0) {
       traverseLeft.setMaxSpeed(traverseSpeed * 0.2);
       traverseRight.setMaxSpeed(traverseSpeed * 0.2);
       long pullOffSteps = (long)(2.0 * stepsPerMm + 0.5);
-      traverseLeft.moveTo(traverseLeft.currentPosition() + pullOffSteps); // Final pull off (Positive Direction)
-      traverseRight.moveTo(traverseRight.currentPosition() + pullOffSteps);
+      traverseLeft.moveTo(traverseLeft.currentPosition() - pullOffSteps);  // Final pull off (Negative Direction)
+      traverseRight.moveTo(traverseRight.currentPosition() - pullOffSteps);
       homingState = 3;
     }
   } else if (homingState == 3) { // Pull off
@@ -679,7 +679,7 @@ void handleHome() {
 void handleStatus() {
   float currentMm = (float)traverseLeft.currentPosition() / stepsPerMm;
   if (isnan(currentMm) || isinf(currentMm)) currentMm = 0.0;
-  
+
   String json = "{";
   json += "\"turns\":" + String(configuredTurns) + ",";
   json += "\"startMm\":" + String(configuredStartMm, 1) + ",";
@@ -694,7 +694,7 @@ void handleStatus() {
   json += "\"jogging\":" + (jogging ? String("true") : String("false")) + ",";
   json += "\"xlim\":" + (digitalRead(X_LIMIT_PIN) == LOW ? String("true") : String("false")) + ",";
   json += "\"ylim\":" + (digitalRead(Y_LIMIT_PIN) == LOW ? String("true") : String("false")) + ",";
-  json += "\"probe\":" + (digitalRead(PROBE_PIN) == LOW ? String("true") : String("false"));
+  json += "\"probe\":" + (digitalRead(PROBE_PIN) == HIGH ? String("true") : String("false"));
   json += "}";
   server.send(200, "application/json", json);
 }
