@@ -112,6 +112,14 @@ volatile bool homed = false;
 volatile bool homing = false;
 volatile int homingState = 0;
 
+// Command flags: set by web/serial handlers (Core 0), consumed by loop() (Core 1)
+// This prevents unsafe cross-core AccelStepper access.
+volatile bool cmd_home = false;
+volatile bool cmd_start = false;
+volatile bool cmd_stop = false;
+volatile bool cmd_jog = false;
+volatile float cmd_jog_dist = 0.0f;
+
 IPAddress apIP(192, 168, 4, 1);
 WebServer server(80);
 String commandLine = "";
@@ -425,14 +433,42 @@ void setup() {
 }
 
 void loop() {
+  // --- Process commands queued by web handlers (Core 0) safely on Core 1 ---
+  if (cmd_stop) {
+    cmd_stop = false; cmd_home = false; cmd_start = false; cmd_jog = false;
+    running = false; homing = false; jogging = false;
+    traverseLeft.stop(); traverseRight.stop(); spindle.stop();
+    Serial.println("Motion stopped.");
+  }
+
+  if (cmd_home && !homing && !running && !jogging) {
+    cmd_home = false;
+    homing = true; homingState = 0;
+    traverseLeft.setMaxSpeed(traverseSpeed * 0.5);
+    traverseRight.setMaxSpeed(traverseSpeed * 0.5);
+    traverseLeft.moveTo(traverseLeft.currentPosition() - 100000);
+    traverseRight.moveTo(traverseRight.currentPosition() - 100000);
+    Serial.println("Homing: Seeking endstop...");
+  }
+
+  if (cmd_jog && !homing && !running) {
+    cmd_jog = false;
+    long steps = (long)(cmd_jog_dist * stepsPerMm);
+    traverseLeft.setMaxSpeed(traverseSpeed);
+    traverseRight.setMaxSpeed(traverseSpeed);
+    traverseLeft.move(steps); traverseRight.move(steps);
+    jogging = true;
+  }
+
+  if (cmd_start && !homing && !running && !jogging) {
+    cmd_start = false;
+    startMotion();
+  }
+
   // EMERGENCY STOP PROBE CHECK (Active LOW)
   if (digitalRead(PROBE_PIN) == LOW && (running || homing || jogging)) {
-    running = false;
-    homing = false;
-    jogging = false;
-    traverseLeft.stop();
-    traverseRight.stop();
-    spindle.stop();
+    running = false; homing = false; jogging = false;
+    traverseLeft.stop(); traverseRight.stop(); spindle.stop();
     Serial.println("E-STOP TRIGGERED! All motion halted.");
   }
 
@@ -603,11 +639,8 @@ void handleJog() {
     return;
   }
   if (server.hasArg("dist")) {
-    float dist = server.arg("dist").toFloat();
-    long steps = (long)(dist * stepsPerMm);
-    traverseLeft.move(steps);
-    traverseRight.move(steps);
-    jogging = true;
+    cmd_jog_dist = server.arg("dist").toFloat();
+    cmd_jog = true;
   }
   server.send(200, "text/plain", "OK");
 }
@@ -626,28 +659,20 @@ void handleSetEndPos() {
 
 void handleStart() {
   if (!homed) {
-    Serial.println("Cannot start: traverse not homed.");
-  } else if (!running && !homing && !jogging) {
-    startMotion();
+    server.send(200, "text/plain", "NOT_HOMED");
+    return;
   }
-  server.send(200, "text/plain", homed ? "OK" : "NOT_HOMED");
+  cmd_start = true;
+  server.send(200, "text/plain", "OK");
 }
 
 void handleStop() {
-  stopMotion();
+  cmd_stop = true;
   server.send(200, "text/plain", "OK");
 }
 
 void handleHome() {
-  if (!homing && !running && !jogging) {
-    homing = true;
-    homingState = 0;
-    traverseLeft.setMaxSpeed(traverseSpeed * 0.5);
-    traverseRight.setMaxSpeed(traverseSpeed * 0.5);
-    traverseLeft.moveTo(traverseLeft.currentPosition() - 100000); // Seeking (Negative Direction)
-    traverseRight.moveTo(traverseRight.currentPosition() - 100000);
-    Serial.println("Homing: Seeking endstop...");
-  }
+  cmd_home = true;
   server.send(200, "text/plain", "OK");
 }
 
