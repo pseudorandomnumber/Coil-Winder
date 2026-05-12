@@ -11,6 +11,9 @@ void handleStart();
 void handleStop();
 void handleHome();
 void handleStatus();
+void handleJog();
+void handleSetStartPos();
+void handleSetEndPos();
 void handleNotFound();
 void readSerial();
 void startMotion();
@@ -21,38 +24,36 @@ float parseFloatValue(const String &text);
 void updateTraverseLimits();
 void handleHoming();
 void handleRunning();
+void handleJogging();
 
 // I2S Shift Register pins for MKS DLC32 V2.1
 const int SR_BCK_PIN = 16;
 const int SR_DATA_PIN = 21;
 const int SR_WS_PIN = 17;
 
-// Traverse endstop input (Y-limit switch on ESP32)
-const int TRAVERSE_HOME_PIN = 35;
+// Limit Switches
+const int X_LIMIT_PIN = 36; // Traverse Left
+const int Y_LIMIT_PIN = 35; // Traverse Right
+const int PROBE_PIN = 22;   // E-Stop / General Probe
 
 uint8_t sr_state = 0; // Bit 0 (EN) is 0 -> enabled
 
-static inline void sr_delay() {
-  for(int i=0; i<4; i++) asm volatile("nop");
-}
-
-void updateShiftRegister() {
+void IRAM_ATTR updateShiftRegister() {
   GPIO.out_w1tc = (1 << SR_WS_PIN); // Latch LOW
-  sr_delay();
+  asm volatile("nop; nop; nop; nop;");
   for (int i = 7; i >= 0; i--) {
     if ((sr_state >> i) & 1) {
       GPIO.out_w1ts = (1 << SR_DATA_PIN); // Data HIGH
     } else {
       GPIO.out_w1tc = (1 << SR_DATA_PIN); // Data LOW
     }
-    sr_delay();
+    asm volatile("nop; nop; nop; nop;");
     GPIO.out_w1ts = (1 << SR_BCK_PIN); // Clock HIGH
-    sr_delay();
+    asm volatile("nop; nop; nop; nop;");
     GPIO.out_w1tc = (1 << SR_BCK_PIN); // Clock LOW
-    sr_delay();
   }
+  asm volatile("nop; nop; nop; nop;");
   GPIO.out_w1ts = (1 << SR_WS_PIN); // Latch HIGH
-  sr_delay();
 }
 
 class ShiftStepper : public AccelStepper {
@@ -71,20 +72,21 @@ public:
     dir_inverted = inv;
   }
 
-  virtual void setOutputPins(uint8_t mask) override {
-    bool step_high = mask & 0b01;
-    bool dir_high = mask & 0b10;
-
-    if (dir_inverted) {
-      dir_high = !dir_high;
-    }
-
-    if (step_high) sr_state |= (1 << step_bit);
-    else sr_state &= ~(1 << step_bit);
+  virtual void step1(long step) override {
+    bool dir_high = (_direction == DIRECTION_CW);
+    if (dir_inverted) dir_high = !dir_high;
 
     if (dir_high) sr_state |= (1 << dir_bit);
     else sr_state &= ~(1 << dir_bit);
 
+    // Step HIGH
+    sr_state |= (1 << step_bit);
+    updateShiftRegister();
+
+    delayMicroseconds(1);
+
+    // Step LOW
+    sr_state &= ~(1 << step_bit);
     updateShiftRegister();
   }
 };
@@ -99,16 +101,17 @@ float configuredEndMm = 50.0;
 float stepsPerMm = 10.0;
 long startSteps = 0;
 long endSteps = 500;
-float traverseSpeed = 600.0;
-float spindleSpeed = 1000.0;  // Spindle speed in steps/second
 
-bool running = false;
-bool homed = false;
-bool homing = false;
+// Default speeds
+volatile float traverseSpeed = 4000.0;
+volatile float spindleSpeed = 8000.0;  // Spindle speed in steps/second
 
-const char* AP_SSID = "CoilWinder";
-const char* AP_PASS = "coil1234";
-// WIFI_SSID and WIFI_PASS are defined in secrets.h
+volatile bool running = false;
+volatile bool jogging = false;
+volatile bool homed = false;
+volatile bool homing = false;
+volatile int homingState = 0;
+
 IPAddress apIP(192, 168, 4, 1);
 WebServer server(80);
 String commandLine = "";
@@ -121,60 +124,188 @@ const char index_html[] PROGMEM = R"rawliteral(
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Coil Winder</title>
   <style>
-    body { font-family: Arial, sans-serif; margin: 16px; color: #222; }
-    .card { background: #f4f4f4; border-radius: 12px; padding: 16px; margin-bottom: 16px; }
-    label { display: block; margin: 8px 0 4px; }
-    input { width: 100%; padding: 10px; font-size: 18px; border: 1px solid #ccc; border-radius: 8px; }
-    button { width: 48%; padding: 12px; font-size: 18px; margin-top: 12px; border: none; border-radius: 8px; }
+    body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 0; padding: 16px; background: #eef2f5; color: #333; }
+    .header { text-align: center; margin-bottom: 24px; }
+    .header h1 { margin: 12px 0 4px; color: #2c3e50; font-size: 28px; }
+    .header p { margin: 0; font-style: italic; color: #7f8c8d; font-size: 16px; }
+    .card { background: #fff; border-radius: 12px; padding: 20px; margin-bottom: 20px; box-shadow: 0 2px 10px rgba(0,0,0,0.05); }
+    h2 { margin-top: 0; color: #2c3e50; font-size: 20px; border-bottom: 2px solid #ecf0f1; padding-bottom: 8px; }
+    .stats-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 16px; }
+    .stat-box { background: #f8f9fa; padding: 12px; border-radius: 8px; text-align: center; border: 1px solid #e9ecef; }
+    .stat-box .label { font-size: 12px; color: #6c757d; text-transform: uppercase; letter-spacing: 0.5px; }
+    .stat-box .value { font-size: 20px; font-weight: bold; color: #2c3e50; margin-top: 4px; }
+    label { display: block; margin: 12px 0 4px; font-weight: 600; font-size: 14px; color: #495057; }
+    input { width: 100%; box-sizing: border-box; padding: 12px; font-size: 16px; border: 1px solid #ced4da; border-radius: 8px; transition: border-color 0.15s; }
+    input:focus { border-color: #80bdff; outline: 0; }
+    .btn-group { display: flex; gap: 10px; margin-top: 16px; flex-wrap: wrap; }
+    button { flex: 1; padding: 14px; font-size: 16px; font-weight: bold; border: none; border-radius: 8px; cursor: pointer; transition: opacity 0.2s; text-transform: uppercase; }
+    button:active { opacity: 0.8; }
     button.start { background: #28a745; color: white; }
-    button.stop { background: #dc3545; color: white; }
-    button.save { background: #007bff; color: white; width: 100%; }
-    button.home { background: #f0ad4e; color: white; width: 100%; }
-    .status { font-size: 18px; margin-top: 8px; }
+    button.stop { background: #dc3545; color: white; min-width: 100%; margin-top: 10px; font-size: 20px; }
+    button.save { background: #007bff; color: white; width: 100%; margin-top: 16px; }
+    button.home { background: #f0ad4e; color: white; }
+    button.speed { background: #17a2b8; color: white; min-width: 20%; padding: 10px; font-size: 14px; }
+    button.jog { background: #6c757d; color: white; padding: 10px; font-size: 14px; }
+    button.set-pos { background: #ffc107; color: #212529; padding: 10px; font-size: 14px; }
+    .speed-control, .jog-control { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+    .badge { display: inline-block; padding: 4px 8px; border-radius: 4px; font-size: 12px; font-weight: bold; color: white; }
+    .badge.green { background: #28a745; }
+    .badge.red { background: #dc3545; }
+    .badge.gray { background: #6c757d; }
   </style>
 </head>
 <body>
-  <div class="card">
+  <div class="header">
     <h1>Coil Winder</h1>
-    <div class="status" id="status">Loading...</div>
+    <p>WAAS - Winding as a service</p>
   </div>
+  
   <div class="card">
+    <h2>Real-time Stats</h2>
+    <div class="stats-grid">
+      <div class="stat-box"><div class="label">Position (mm)</div><div class="value" id="stat-pos">0.0</div></div>
+      <div class="stat-box"><div class="label">State</div><div class="value" id="stat-state">STOPPED</div></div>
+      <div class="stat-box"><div class="label">Homed</div><div class="value" id="stat-homed">NO</div></div>
+      <div class="stat-box"><div class="label">Speed (steps/s)</div><div class="value" id="stat-speed">0</div></div>
+      
+      <div class="stat-box"><div class="label">X-Limit (Left)</div><div class="value" id="stat-xlim"><span class="badge gray">Unknown</span></div></div>
+      <div class="stat-box"><div class="label">Y-Limit (Right)</div><div class="value" id="stat-ylim"><span class="badge gray">Unknown</span></div></div>
+      <div class="stat-box" style="grid-column: span 2;"><div class="label">Probe (E-STOP)</div><div class="value" id="stat-probe"><span class="badge gray">Unknown</span></div></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Control</h2>
+    <div class="btn-group">
+      <button class="home" onclick="sendAction('home')">Home Traverse</button>
+      <button class="start" onclick="sendAction('start')">Start Winding</button>
+    </div>
+    <button class="stop" onclick="sendAction('stop')">E-STOP / HALT</button>
+    
+    <div style="margin-top: 20px; border-top: 1px solid #ecf0f1; padding-top: 16px;">
+      <label>Jog Traverse Axis</label>
+      <div class="jog-control">
+        <button class="jog" onclick="jog(-10)">-10mm</button>
+        <button class="jog" onclick="jog(-1)">-1mm</button>
+        <button class="jog" onclick="jog(1)">+1mm</button>
+        <button class="jog" onclick="jog(10)">+10mm</button>
+      </div>
+    </div>
+
+    <div style="margin-top: 20px; border-top: 1px solid #ecf0f1; padding-top: 16px;">
+      <label>Set Positions</label>
+      <div class="jog-control">
+        <button class="set-pos" onclick="setStartPos()">Set START to Current</button>
+        <button class="set-pos" onclick="setEndPos()">Set END to Current</button>
+      </div>
+    </div>
+    
+    <div style="margin-top: 20px; border-top: 1px solid #ecf0f1; padding-top: 16px;">
+      <label>Live Speed Override</label>
+      <div class="speed-control">
+        <button class="speed" onclick="adjustSpeed(0.5)">50%</button>
+        <button class="speed" onclick="adjustSpeed(1.0)">100%</button>
+        <button class="speed" onclick="adjustSpeed(1.5)">150%</button>
+        <button class="speed" onclick="adjustSpeed(2.0)">200%</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Configuration</h2>
     <label for="turns">Turns (target)</label>
-    <input type="number" id="turns" min="1" step="1" value="100" />
+    <input type="number" id="turns" min="1" step="1" />
     <label for="start">Traverse start (mm)</label>
-    <input type="number" id="start" min="0" step="0.1" value="0" />
+    <input type="number" id="start" min="0" step="0.1" />
     <label for="end">Traverse end (mm)</label>
-    <input type="number" id="end" min="0" step="0.1" value="50" />
+    <input type="number" id="end" min="0" step="0.1" />
     <label for="stepsPerMm">Steps per mm</label>
-    <input type="number" id="stepsPerMm" min="0.1" step="0.1" value="10" />
-    <label for="speed">Traverse speed (steps/s)</label>
-    <input type="number" id="speed" min="50" step="5" value="600" />
-    <label for="spindleSpeed">Spindle speed (steps/s)</label>
-    <input type="number" id="spindleSpeed" min="10" step="10" value="1000" />
+    <input type="number" id="stepsPerMm" min="0.1" step="0.1" />
+    <label for="speed">Base Traverse speed (steps/s)</label>
+    <input type="number" id="speed" min="50" step="5" />
+    <label for="spindleSpeed">Base Spindle speed (steps/s)</label>
+    <input type="number" id="spindleSpeed" min="10" step="10" />
     <button class="save" onclick="saveParams()">Save Parameters</button>
   </div>
-  <div class="card">
-    <button class="home" onclick="sendAction('home')">Home Traverse</button>
-    <button class="start" onclick="sendAction('start')">START</button>
-    <button class="stop" onclick="sendAction('stop')">STOP</button>
-  </div>
+
   <script>
-    async function loadStatus() {
-      const response = await fetch('/status');
-      const data = await response.json();
-      document.getElementById('status').innerText =
-        `TURNS=${data.turns} START=${data.startMm} END=${data.endMm} POS=${data.currentMm}mm HOMED=${data.homed ? 'YES' : 'NO'} STATE=${data.running ? 'RUNNING' : 'STOPPED'}`;
-      document.getElementById('turns').value = data.turns;
-      document.getElementById('start').value = data.startMm;
-      document.getElementById('end').value = data.endMm;
-      document.getElementById('stepsPerMm').value = data.stepsPerMm;
-      document.getElementById('speed').value = data.speed;
-      document.getElementById('spindleSpeed').value = data.spindleSpeed;
+    let firstLoad = true;
+    let baseSpindleSpeed = 8000;
+    let baseTraverseSpeed = 4000;
+
+    function updateBadge(id, triggered) {
+      const el = document.getElementById(id);
+      if(!el) return;
+      if(triggered) {
+        el.innerHTML = '<span class="badge red">TRIGGERED</span>';
+      } else {
+        el.innerHTML = '<span class="badge green">OPEN</span>';
+      }
     }
+
+    async function loadStatus() {
+      try {
+        const response = await fetch('/status');
+        const data = await response.json();
+        
+        const posEl = document.getElementById('stat-pos');
+        if(posEl) posEl.innerText = (data.currentMm !== undefined && data.currentMm !== null) ? data.currentMm.toFixed(1) : "0.0";
+        
+        const stateEl = document.getElementById('stat-state');
+        if(stateEl) stateEl.innerText = data.running ? 'RUNNING' : (data.homing ? 'HOMING' : (data.jogging ? 'JOGGING' : 'STOPPED'));
+        
+        const homedEl = document.getElementById('stat-homed');
+        if(homedEl) homedEl.innerText = data.homed ? 'YES' : 'NO';
+        
+        const speedEl = document.getElementById('stat-speed');
+        if(speedEl) speedEl.innerText = (data.speed !== undefined && data.speed !== null) ? data.speed.toFixed(0) : "0";
+        
+        updateBadge('stat-xlim', data.xlim);
+        updateBadge('stat-ylim', data.ylim);
+        updateBadge('stat-probe', data.probe);
+
+        if (firstLoad) {
+          document.getElementById('turns').value = data.turns;
+          document.getElementById('start').value = data.startMm;
+          document.getElementById('end').value = data.endMm;
+          document.getElementById('stepsPerMm').value = data.stepsPerMm;
+          document.getElementById('speed').value = data.speed;
+          document.getElementById('spindleSpeed').value = data.spindleSpeed;
+          baseTraverseSpeed = data.speed;
+          baseSpindleSpeed = data.spindleSpeed;
+          firstLoad = false;
+        }
+      } catch (e) {
+        console.error("Error loading status:", e);
+      }
+    }
+    
     async function sendAction(action) {
-      await fetch('/' + action);
+      const response = await fetch('/' + action);
+      const text = await response.text();
+      if (text === 'NOT_HOMED') {
+        alert('Cannot start: Traverse axis not homed yet!');
+      }
       await loadStatus();
     }
+    
+    async function jog(dist) {
+      await fetch('/jog?dist=' + dist);
+      await loadStatus();
+    }
+
+    async function setStartPos() {
+      await fetch('/set_start_pos');
+      firstLoad = true; // Force reload of values
+      await loadStatus();
+    }
+
+    async function setEndPos() {
+      await fetch('/set_end_pos');
+      firstLoad = true;
+      await loadStatus();
+    }
+
     async function saveParams() {
       const turns = document.getElementById('turns').value;
       const start = document.getElementById('start').value;
@@ -182,15 +313,35 @@ const char index_html[] PROGMEM = R"rawliteral(
       const stepsPerMm = document.getElementById('stepsPerMm').value;
       const speed = document.getElementById('speed').value;
       const spindleSpeed = document.getElementById('spindleSpeed').value;
+      
+      baseTraverseSpeed = speed;
+      baseSpindleSpeed = spindleSpeed;
+      
       await fetch(`/set?turns=${turns}&start=${start}&end=${end}&stepsPerMm=${stepsPerMm}&speed=${speed}&spindleSpeed=${spindleSpeed}`);
       await loadStatus();
     }
+
+    async function adjustSpeed(multiplier) {
+      const newSpeed = baseTraverseSpeed * multiplier;
+      const newSpindle = baseSpindleSpeed * multiplier;
+      await fetch(`/set?speed=${newSpeed}&spindleSpeed=${newSpindle}`);
+      await loadStatus();
+    }
+
     loadStatus();
-    setInterval(loadStatus, 3000);
+    setInterval(loadStatus, 1000);
   </script>
 </body>
 </html>
 )rawliteral";
+
+void webServerTask(void * pvParameters) {
+  for (;;) {
+    server.handleClient();
+    readSerial();
+    vTaskDelay(10 / portTICK_PERIOD_MS);
+  }
+}
 
 void setup() {
   Serial.begin(115200);
@@ -202,20 +353,29 @@ void setup() {
   digitalWrite(SR_WS_PIN, HIGH);
   updateShiftRegister();
 
-  pinMode(TRAVERSE_HOME_PIN, INPUT_PULLUP);
+  // GPIO 36 and 35 are input-only pins on the ESP32 and do NOT support INPUT_PULLUP.
+  // The MKS DLC32 board has external 10k pull-ups on these limit switch inputs.
+  pinMode(X_LIMIT_PIN, INPUT);
+  pinMode(Y_LIMIT_PIN, INPUT);
+  pinMode(PROBE_PIN, INPUT_PULLUP);
 
+  traverseLeft.setMinPulseWidth(0);
   traverseLeft.setMaxSpeed(traverseSpeed);
-  traverseLeft.setAcceleration(1000);
+  traverseLeft.setAcceleration(10000);
+  
+  traverseRight.setMinPulseWidth(0);
   traverseRight.setMaxSpeed(traverseSpeed);
-  traverseRight.setAcceleration(1000);
+  traverseRight.setAcceleration(10000);
+
+  spindle.setMinPulseWidth(0);
   spindle.setMaxSpeed(spindleSpeed);
-  spindle.setAcceleration(500);
+  spindle.setAcceleration(10000);
 
   updateTraverseLimits();
 
   WiFi.mode(WIFI_AP_STA);
   WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));
-  WiFi.softAP(AP_SSID, AP_PASS);
+  WiFi.softAP("CoilWinder", "coil1234");
 
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   Serial.printf("Connecting to WiFi %s", WIFI_SSID);
@@ -226,6 +386,7 @@ void setup() {
   }
 
   if (WiFi.status() == WL_CONNECTED) {
+    WiFi.mode(WIFI_STA); // Disable AP mode if connected to home network
     Serial.println();
     Serial.printf("Connected to %s, IP=%s\n", WIFI_SSID, WiFi.localIP().toString().c_str());
     if (MDNS.begin("coilwinder")) {
@@ -244,27 +405,46 @@ void setup() {
   server.on("/stop", HTTP_GET, handleStop);
   server.on("/home", HTTP_GET, handleHome);
   server.on("/status", HTTP_GET, handleStatus);
+  server.on("/jog", HTTP_GET, handleJog);
+  server.on("/set_start_pos", HTTP_GET, handleSetStartPos);
+  server.on("/set_end_pos", HTTP_GET, handleSetEndPos);
   server.onNotFound(handleNotFound);
   server.begin();
 
-  Serial.printf("SoftAP started: %s\n", AP_SSID);
-  Serial.printf("AP URL: http://%s\n", apIP.toString().c_str());
-  Serial.println("Use http://coilwinder.local if your network supports mDNS.");
+  xTaskCreatePinnedToCore(
+    webServerTask,
+    "WebServer",
+    8192,
+    NULL,
+    1,
+    NULL,
+    0
+  );
+
+  Serial.println("System ready.");
 }
 
 void loop() {
-  server.handleClient();
+  // EMERGENCY STOP PROBE CHECK (Active LOW)
+  if (digitalRead(PROBE_PIN) == LOW && (running || homing || jogging)) {
+    running = false;
+    homing = false;
+    jogging = false;
+    traverseLeft.stop();
+    traverseRight.stop();
+    spindle.stop();
+    Serial.println("E-STOP TRIGGERED! All motion halted.");
+  }
 
   if (homing) {
     handleHoming();
   } else if (running) {
     handleRunning();
+  } else if (jogging) {
+    handleJogging();
   }
 
-  // Always run the spindle if it has a target speed
   spindle.run();
-
-  readSerial();
 }
 
 void updateTraverseLimits() {
@@ -296,35 +476,87 @@ void handleRunning() {
   traverseRight.run();
 }
 
+void handleJogging() {
+  traverseLeft.run();
+  traverseRight.run();
+  if (traverseLeft.distanceToGo() == 0 && traverseRight.distanceToGo() == 0) {
+    jogging = false;
+  }
+}
+
 void handleHoming() {
-  static unsigned long lastDebugTime = 0;
+  // Switches are normally-open, pull pin to GND when triggered -> LOW = triggered
+  bool x_endstop = (digitalRead(X_LIMIT_PIN) == LOW);
+  bool y_endstop = (digitalRead(Y_LIMIT_PIN) == LOW);
   
-  if (digitalRead(TRAVERSE_HOME_PIN) == HIGH) {
-    // Endstop triggered, both motors have reached home
-    traverseLeft.stop();
-    traverseRight.stop();
-    setTraversePosition(startSteps);
-    homing = false;
-    homed = true;
-    moveTraverseTo(endSteps);
-    Serial.println("Traverse homing complete.");
-  } else {
-    // Continue moving both motors towards endstop
+  if (homingState == 0) { // Seeking (Negative Direction)
+    if (x_endstop) traverseLeft.stop();
+    if (y_endstop) traverseRight.stop();
+    
+    if (traverseLeft.distanceToGo() == 0 && traverseRight.distanceToGo() == 0) {
+      homingState = 4;
+    }
+  } else if (homingState == 4) { // wait stop
+    if (traverseLeft.distanceToGo() == 0 && traverseRight.distanceToGo() == 0) {
+      traverseLeft.setMaxSpeed(traverseSpeed * 0.25);
+      traverseRight.setMaxSpeed(traverseSpeed * 0.25);
+      traverseLeft.moveTo(traverseLeft.currentPosition() + 100000); // Pull away (Positive Direction)
+      traverseRight.moveTo(traverseRight.currentPosition() + 100000);
+      homingState = 1;
+    }
+  } else if (homingState == 1) { // Pulling away
+    if (!x_endstop) traverseLeft.stop();
+    if (!y_endstop) traverseRight.stop();
+
+    if (traverseLeft.distanceToGo() == 0 && traverseRight.distanceToGo() == 0) {
+      homingState = 5;
+    }
+  } else if (homingState == 5) { // wait stop
+    if (traverseLeft.distanceToGo() == 0 && traverseRight.distanceToGo() == 0) {
+      traverseLeft.setMaxSpeed(traverseSpeed * 0.05);
+      traverseRight.setMaxSpeed(traverseSpeed * 0.05);
+      traverseLeft.moveTo(traverseLeft.currentPosition() - 100000); // Slow seek (Negative Direction)
+      traverseRight.moveTo(traverseRight.currentPosition() - 100000);
+      homingState = 2;
+    }
+  } else if (homingState == 2) { // Slow seek
+    if (x_endstop) traverseLeft.stop();
+    if (y_endstop) traverseRight.stop();
+
+    if (traverseLeft.distanceToGo() == 0 && traverseRight.distanceToGo() == 0) {
+      homingState = 6;
+    }
+  } else if (homingState == 6) { // wait stop
+    if (traverseLeft.distanceToGo() == 0 && traverseRight.distanceToGo() == 0) {
+      traverseLeft.setMaxSpeed(traverseSpeed * 0.2);
+      traverseRight.setMaxSpeed(traverseSpeed * 0.2);
+      long pullOffSteps = (long)(2.0 * stepsPerMm + 0.5);
+      traverseLeft.moveTo(traverseLeft.currentPosition() + pullOffSteps); // Final pull off (Positive Direction)
+      traverseRight.moveTo(traverseRight.currentPosition() + pullOffSteps);
+      homingState = 3;
+    }
+  } else if (homingState == 3) { // Pull off
+    if (traverseLeft.distanceToGo() == 0 && traverseRight.distanceToGo() == 0) {
+      setTraversePosition(startSteps);
+      homing = false;
+      homed = true;
+      moveTraverseTo(endSteps);
+      traverseLeft.setMaxSpeed(traverseSpeed);
+      traverseRight.setMaxSpeed(traverseSpeed);
+      Serial.println("Traverse homing complete.");
+    }
+  }
+
+  if (homing) {
     traverseLeft.run();
     traverseRight.run();
-    
-    // Debug output every 500ms
-    if (millis() - lastDebugTime > 500) {
-      Serial.printf("Homing: endstop_pin=%d, left_pos=%ld, right_pos=%ld\n", 
-                    digitalRead(TRAVERSE_HOME_PIN), 
-                    traverseLeft.currentPosition(), 
-                    traverseRight.currentPosition());
-      lastDebugTime = millis();
-    }
   }
 }
 
 void handleRoot() {
+  server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+  server.sendHeader("Pragma", "no-cache");
+  server.sendHeader("Expires", "-1");
   server.send_P(200, "text/html", index_html);
 }
 
@@ -365,10 +597,37 @@ void handleSet() {
   server.send(200, "text/plain", "OK");
 }
 
+void handleJog() {
+  if (running || homing) {
+    server.send(400, "text/plain", "Busy");
+    return;
+  }
+  if (server.hasArg("dist")) {
+    float dist = server.arg("dist").toFloat();
+    long steps = (long)(dist * stepsPerMm);
+    traverseLeft.move(steps);
+    traverseRight.move(steps);
+    jogging = true;
+  }
+  server.send(200, "text/plain", "OK");
+}
+
+void handleSetStartPos() {
+  configuredStartMm = (float)traverseLeft.currentPosition() / stepsPerMm;
+  updateTraverseLimits();
+  server.send(200, "text/plain", "OK");
+}
+
+void handleSetEndPos() {
+  configuredEndMm = (float)traverseLeft.currentPosition() / stepsPerMm;
+  updateTraverseLimits();
+  server.send(200, "text/plain", "OK");
+}
+
 void handleStart() {
   if (!homed) {
     Serial.println("Cannot start: traverse not homed.");
-  } else if (!running) {
+  } else if (!running && !homing && !jogging) {
     startMotion();
   }
   server.send(200, "text/plain", homed ? "OK" : "NOT_HOMED");
@@ -380,19 +639,22 @@ void handleStop() {
 }
 
 void handleHome() {
-  if (!homing) {
+  if (!homing && !running && !jogging) {
     homing = true;
-    traverseLeft.setMaxSpeed(traverseSpeed * 0.25);
-    traverseRight.setMaxSpeed(traverseSpeed * 0.25);
-    traverseLeft.moveTo(-100000);
-    traverseRight.moveTo(-100000);
-    Serial.println("Starting traverse homing...");
+    homingState = 0;
+    traverseLeft.setMaxSpeed(traverseSpeed * 0.5);
+    traverseRight.setMaxSpeed(traverseSpeed * 0.5);
+    traverseLeft.moveTo(traverseLeft.currentPosition() - 100000); // Seeking (Negative Direction)
+    traverseRight.moveTo(traverseRight.currentPosition() - 100000);
+    Serial.println("Homing: Seeking endstop...");
   }
   server.send(200, "text/plain", "OK");
 }
 
 void handleStatus() {
   float currentMm = (float)traverseLeft.currentPosition() / stepsPerMm;
+  if (isnan(currentMm) || isinf(currentMm)) currentMm = 0.0;
+  
   String json = "{";
   json += "\"turns\":" + String(configuredTurns) + ",";
   json += "\"startMm\":" + String(configuredStartMm, 1) + ",";
@@ -401,8 +663,13 @@ void handleStatus() {
   json += "\"speed\":" + String(traverseSpeed, 1) + ",";
   json += "\"spindleSpeed\":" + String(spindleSpeed, 1) + ",";
   json += "\"currentMm\":" + String(currentMm, 1) + ",";
-  json += "\"homed\":" + String(homed ? "true" : "false") + ",";
-  json += "\"running\":" + String(running ? "true" : "false");
+  json += "\"homed\":" + (homed ? String("true") : String("false")) + ",";
+  json += "\"running\":" + (running ? String("true") : String("false")) + ",";
+  json += "\"homing\":" + (homing ? String("true") : String("false")) + ",";
+  json += "\"jogging\":" + (jogging ? String("true") : String("false")) + ",";
+  json += "\"xlim\":" + (digitalRead(X_LIMIT_PIN) == LOW ? String("true") : String("false")) + ",";
+  json += "\"ylim\":" + (digitalRead(Y_LIMIT_PIN) == LOW ? String("true") : String("false")) + ",";
+  json += "\"probe\":" + (digitalRead(PROBE_PIN) == LOW ? String("true") : String("false"));
   json += "}";
   server.send(200, "application/json", json);
 }
@@ -507,6 +774,7 @@ void startMotion() {
 
 void stopMotion() {
   running = false;
+  jogging = false;
   traverseLeft.stop();
   traverseRight.stop();
   spindle.stop();
